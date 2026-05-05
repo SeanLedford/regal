@@ -41,6 +41,7 @@ import (
 	"github.com/open-policy-agent/regal/internal/lsp/rego"
 	"github.com/open-policy-agent/regal/internal/lsp/rego/query"
 	"github.com/open-policy-agent/regal/internal/lsp/semantictokens"
+	"github.com/open-policy-agent/regal/internal/lsp/testgen"
 	"github.com/open-policy-agent/regal/internal/lsp/types"
 	"github.com/open-policy-agent/regal/internal/lsp/uri"
 	rparse "github.com/open-policy-agent/regal/internal/parse"
@@ -114,6 +115,7 @@ func DefaultServerFeatureFlags() *types.ServerFeatureFlags {
 		InlineEvaluationProvider: true,
 		DebugProvider:            true,
 		OPATestProvider:          true,
+		TestGenerationProvider:   true,
 	}
 }
 
@@ -541,6 +543,14 @@ func (l *LanguageServer) StartCommandWorker(ctx context.Context) {
 				if params.Command == "regal.explorer" {
 					if err := l.handleExplorerCommand(ctx, params); err != nil {
 						l.log.Message("failed to handle explorer command: %s", err)
+					}
+
+					continue
+				}
+
+				if params.Command == "regal.generateTest" {
+					if err := l.handleGenerateTestCommand(ctx, params); err != nil {
+						l.log.Message("failed to handle generateTest command: %s", err)
 					}
 
 					continue
@@ -1778,6 +1788,10 @@ func (l *LanguageServer) handleInitialize(ctx context.Context, params types.Init
 		enabledCommands = append(enabledCommands, "regal.explorer")
 	}
 
+	if l.featureFlags.TestGenerationProvider {
+		enabledCommands = append(enabledCommands, "regal.generateTest")
+	}
+
 	initializeResult := types.InitializeResult{
 		Capabilities: types.ServerCapabilities{
 			TextDocumentSyncOptions: types.TextDocumentSyncOptions{
@@ -1849,10 +1863,11 @@ func (l *LanguageServer) handleInitialize(ctx context.Context, params types.Init
 			// 'custom' additions that are ready for use, but not in the base
 			// spec.
 			Experimental: &types.ExperimentalCapabilities{
-				ExplorerProvider:   l.featureFlags.ExplorerProvider,
-				InlineEvalProvider: l.featureFlags.InlineEvaluationProvider,
-				DebugProvider:      l.featureFlags.DebugProvider,
-				OPATestProvider:    l.featureFlags.OPATestProvider,
+				ExplorerProvider:       l.featureFlags.ExplorerProvider,
+				InlineEvalProvider:     l.featureFlags.InlineEvaluationProvider,
+				DebugProvider:          l.featureFlags.DebugProvider,
+				OPATestProvider:        l.featureFlags.OPATestProvider,
+				TestGenerationProvider: l.featureFlags.TestGenerationProvider,
 			},
 		},
 	}
@@ -2443,6 +2458,121 @@ func (l *LanguageServer) handleExplorerCommand(ctx context.Context, params types
 			}
 		}
 	}
+
+	return nil
+}
+
+func (l *LanguageServer) handleGenerateTestCommand(ctx context.Context, params types.ExecuteCommandParams) error {
+	var args types.CommandArgs
+
+	if len(params.Arguments) > 0 {
+		arg, ok := params.Arguments[0].(map[string]any)
+		if !ok {
+			l.log.Message(
+				"failed to unmarshal regal.generateTest command arguments, expected object, got %T",
+				params.Arguments[0],
+			)
+
+			return errors.New("failed to parse generateTest arguments")
+		}
+
+		args = types.CommandArgs{
+			Target: util.GetMapValue[string](arg, "target"),
+			Row:    util.GetMapValue[int](arg, "row"),
+		}
+	}
+
+	if args.Target == "" {
+		l.log.Message("expected command target, got empty string")
+
+		return errors.New("target file URI is required")
+	}
+
+	filePath := uri.ToPath(args.Target)
+
+	inputPath, inputMap := rio.FindInput(filePath, l.workspacePath())
+	if inputPath == "" || len(inputMap) == 0 {
+		if err := l.conn.Notify(ctx, "window/showMessage", types.ShowMessageParams{
+			Type:    3,
+			Message: "No input.json or input.yaml file found. Create one to provide test input data.",
+		}); err != nil {
+			l.log.Message("failed to show input.json missing message: %v", err)
+		}
+		return errors.New("no input.json found in workspace")
+	}
+
+	_, module, ok := l.cache.GetContentAndModule(args.Target)
+	if !ok {
+		return fmt.Errorf("could not get file contents for uri %q", args.Target)
+	}
+
+	if len(module.Rules) == 0 {
+		return errors.New("no rules found in this file")
+	}
+
+	allModules := l.cache.GetAllModules()
+
+	var testFunctions []string
+
+	packagePath := module.Package.Path.String()
+
+	for _, rule := range module.Rules {
+		ruleName := rule.Head.Name.String()
+
+		testFunction, err := testgen.GenerateTestFunction(testgen.TestGenerationOptions{
+			RuleName:      ruleName,
+			PackagePath:   packagePath,
+			WorkspacePath: l.workspacePath(),
+			FileURI:       args.Target,
+			Rule:          rule,
+			AllModules:    allModules,
+		})
+		if err != nil {
+			continue
+		}
+
+		testFunctions = append(testFunctions, testFunction)
+	}
+
+	if len(testFunctions) == 0 {
+		return errors.New("failed to generate any tests")
+	}
+
+	testHeader := testgen.BuildTestHeader(packagePath)
+	combinedTest := testHeader + "\n\n" + strings.Join(testFunctions, "\n\n")
+
+	if err := l.displayTestResult(combinedTest, args.Target); err != nil {
+		return fmt.Errorf("failed to display test result: %w", err)
+	}
+
+	return nil
+}
+
+func (l *LanguageServer) displayTestResult(testCode, sourceURI string) error {
+	sourceFile := uri.ToPath(sourceURI)
+	baseName := strings.TrimSuffix(filepath.Base(sourceFile), ".rego")
+
+	testFileName := filepath.Join(l.workspacePath(), baseName+"_test.rego")
+
+	if err := os.WriteFile(testFileName, []byte(testCode), 0o600); err != nil {
+		return fmt.Errorf("failed to write test file: %w", err)
+	}
+
+	showParams := types.ShowDocumentParams{
+		URI:       uri.FromPath(l.getClient().Identifier, testFileName),
+		TakeFocus: new(true),
+	}
+
+	var result types.ShowDocumentResult
+
+	rpcCtx, rpcCancel := context.WithTimeout(context.Background(), rpcTimeout)
+
+	//nolint:contextcheck
+	if err := l.conn.Call(rpcCtx, "window/showDocument", showParams, &result); err != nil {
+		return fmt.Errorf("window/showDocument failed: %w", err)
+	}
+
+	rpcCancel()
 
 	return nil
 }

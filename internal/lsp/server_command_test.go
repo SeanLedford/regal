@@ -336,3 +336,121 @@ allow if {
 		t.Fatal("timed out waiting for window/showDocument")
 	}
 }
+
+func TestExecuteCommandGenerateTest(t *testing.T) {
+	t.Parallel()
+
+	testCases := map[string]struct {
+		policyContent string
+		inputJSON     string
+		shouldSucceed bool
+		expectFile    bool
+	}{
+		"simple allow rule with input": {
+			policyContent: `package policy
+
+allow if {
+	input.user == "alice"
+	input.action == "read"
+}`,
+			inputJSON:     `{"user": "alice", "action": "read"}`,
+			shouldSucceed: true,
+			expectFile:    true,
+		},
+		"no input.json should fail": {
+			policyContent: `package policy
+
+allow if {
+	input.user == "alice"
+}`,
+			inputJSON:     "",
+			shouldSucceed: false,
+			expectFile:    false,
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			clientHandler := func(_ context.Context, _ *jsonrpc2.Conn, req *jsonrpc2.Request) (any, error) {
+				switch req.Method {
+				case "window/showDocument":
+					return types.ShowDocumentResult{Success: true}, nil
+				case "window/showMessage":
+					return nil, nil
+				default:
+					return struct{}{}, nil
+				}
+			}
+
+			files := map[string]string{"policy.rego": tc.policyContent}
+			if tc.inputJSON != "" {
+				files["input.json"] = tc.inputJSON
+			}
+
+			tempDir := testutil.TempDirectoryOf(t, files)
+			_, connClient, ctx := createAndInitServer(t, tempDir, clientHandler)
+
+			policyRegoURI := uri.FromPath(clients.IdentifierGoTest, filepath.Join(tempDir, "policy.rego"))
+
+			var executeResponse any
+			must.Equal(t, nil, connClient.Call(ctx, "workspace/executeCommand", types.ExecuteCommandParams{
+				Command: "regal.generateTest",
+				Arguments: []any{
+					map[string]any{
+						"target": policyRegoURI,
+						"row":    1,
+					},
+				},
+			}, &executeResponse))
+
+			t.Logf("Command response: %v", executeResponse)
+
+			expectedTestFile := filepath.Join(tempDir, "policy_test.rego")
+
+			timeout := time.NewTimer(5 * time.Second)
+			defer timeout.Stop()
+
+			fileExists := false
+			if tc.expectFile {
+				for {
+					if _, statErr := os.Stat(expectedTestFile); statErr == nil {
+						fileExists = true
+						break
+					}
+
+					select {
+					case <-timeout.C:
+						break
+					default:
+						time.Sleep(50 * time.Millisecond)
+					}
+				}
+			} else {
+				time.Sleep(100 * time.Millisecond)
+				_, statErr := os.Stat(expectedTestFile)
+				fileExists = statErr == nil
+			}
+
+			if tc.expectFile && !fileExists {
+				t.Errorf("Expected test file to be created, but it wasn't")
+			} else if !tc.expectFile && fileExists {
+				t.Errorf("Expected no test file, but one was created")
+			}
+
+			if fileExists {
+				contents, _ := os.ReadFile(expectedTestFile)
+				t.Logf("Generated test file contents:\n%s", string(contents))
+
+				// Verify some expected content
+				contentsStr := string(contents)
+				if tc.shouldSucceed {
+					must.Equal(t, true, strings.Contains(contentsStr, "package policy_test"), "should contain test package")
+					must.Equal(t, true, strings.Contains(contentsStr, "test_allow if"), "should contain test function")
+					must.Equal(t, true, strings.Contains(contentsStr, "policy.allow"), "should contain rule call")
+				}
+			}
+		})
+	}
+}
